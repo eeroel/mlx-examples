@@ -287,6 +287,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
+        self.prediction = self.body.get("prediction", {}).get("content", None)
         self.validate_model_parameters()
 
         # Load the model if needed
@@ -504,6 +505,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sampler=sampler,
             logits_processors=logits_processors,
             prompt_cache=self.prompt_cache.cache,
+            prediction=self.prediction
         ):
             segment = gen_response.text
             text += segment

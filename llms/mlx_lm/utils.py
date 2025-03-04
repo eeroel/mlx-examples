@@ -487,38 +487,6 @@ def lookup_generate_step(
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
             n = 0
-            while n < num_draft:
-                tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                if tn != dtn:
-                    break
-                n += 1
-                ntoks += 1
-                yield tn, lpn, True
-                if ntoks == max_tokens:
-                    break
-            if ntoks < max_tokens:
-                ntoks += 1
-                yield tokens[n], logprobs[n], False
-
-            if ntoks == max_tokens:
-                break
-
-            y = mx.array([tokens[n]], mx.uint32)
-
-            # remove used prediction tokens
-            # note: need to leave the previous token because it's used for matching
-            # the previous ... token. alternatively we could have a flag "continuing"
-            # so we wouldn't need to, we could just take the draft from lookup_pos
-            if n > 0:
-                pred = mx.concatenate([pred[:lookup_pos - 1], pred[lookup_pos + n - 1:]])
-            # If we accepted all the draft tokens, increase
-            # lookup size
-            if n == 0 or n != num_draft:
-                lookup_wsize = 1
-                lookup_pos = 0
-            else:
-                lookup_wsize = max(32, lookup_wsize*2)
-
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
 
@@ -531,7 +499,7 @@ def lookup_generate_step(
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
-    draft_model: nn.Module,
+    draft_model: Union[nn.Module, Callable],
     *,
     num_draft_tokens=2,
     max_tokens: int = 256,
@@ -549,7 +517,7 @@ def speculative_generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        draft_model (nn.Module): The draft model for speculative decoding.
+        draft_model (Union[nn.Module, Callable]): The draft model for speculative decoding.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
@@ -579,12 +547,14 @@ def speculative_generate_step(
     # Create the KV cache for generation
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
-    elif len(prompt_cache) != (len(model.layers) + len(draft_model.layers)):
+        if isinstance(draft_model, nn.Module):  ## is nn
+            draft_cache = cache.make_prompt_cache(draft_model)
+    elif len(prompt_cache) != (len(model.layers) + (len(draft_model.layers) if isinstance(draft_model, nn.Module) else 0)):
         raise ValueError("Wrong number of layers in the prompt cache.")
     else:
         model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        if isinstance(draft_model, nn.Module):  ## is nn
+            draft_cache = prompt_cache[len(model.layers) :]
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
@@ -639,7 +609,8 @@ def speculative_generate_step(
 
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if isinstance(draft_model, nn.Module):
+            cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -651,9 +622,14 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
+        draft_y = None
+        if isinstance(draft_model, nn.Module):  ## is nn
+            draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
+        if draft_y is None:
+            draft_y = y
 
     ntoks = 0
     # Set these so the finally block doesn't raise
@@ -661,8 +637,13 @@ def speculative_generate_step(
     n = 0
     try:
         while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
+            if isinstance(draft_model, nn.Module):  ## is nn
+                draft_y = _prefill(draft_model, draft_cache, y)
+                num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                draft_tokens = _draft_generate(draft_y, num_draft)
+            else:
+                draft_tokens = draft_model(draft_y)
+                num_draft = len(draft_tokens)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
@@ -671,6 +652,7 @@ def speculative_generate_step(
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
             n = 0
+            #print((draft_tokens, tokens))
             while n < num_draft:
                 tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
                 if tn != dtn:
@@ -686,17 +668,22 @@ def speculative_generate_step(
 
             if ntoks == max_tokens:
                 break
-
+            print(f"accepted {n}")
             y = mx.array([tokens[n]], mx.uint32)
-            draft_y = y
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
-                draft_y = mx.concatenate(
-                    [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                )
+            if isinstance(draft_model, nn.Module):  ## is nn
+                draft_y = y
+
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
+            else:
+                # we want to send all the tokens to the drafter please
+                draft_y = mx.array(tokens[:n+1], mx.uint32)
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
@@ -709,7 +696,7 @@ def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
-    draft_model: Optional[nn.Module] = None,
+    draft_model: Optional[ Union[nn.Module, Callable] ] = None,
     prediction: Optional[ Union[str, mx.array, List[int]]] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
@@ -755,14 +742,104 @@ def stream_generate(
                 )
                 prediction = tokenizer.encode(prediction, add_special_tokens=add_special_tokens)
             prediction = mx.array(prediction)
-        token_generator = lookup_generate_step(prompt, model, prediction=prediction, **kwargs)
-    elif draft_model is None:
+
+            # create custom draft model
+            def construct_drafter(pred_tokens):
+                hist_tokens = []
+                pos = None
+                sz = 1
+
+                def _find_match(A, B):
+                    """
+                    Find the longest subsequence in A that matches a suffix in B.
+                    
+                    Args:
+                        A (str): The string to search for subsequences in
+                        B (str): The string whose suffix we want to match
+                        
+                    Returns:
+                        tuple: (last_position, length, is_unique)
+                            - last_position: Index of the last character of the match in A
+                            - length: Length of the match
+                            - is_unique: Boolean indicating if the match is unique
+                    """
+                    m, n = len(A), len(B)
+                    
+                    # Reverse B to easily iterate over suffixes
+                    B_rev = B[::-1]
+                    
+                    # List to store positions of matches in A
+                    positions = []
+                    
+                    # Two-pointer technique to find the longest subsequence matching suffix of B
+                    j = 0  # Pointer for B_rev
+                    for i in range(m):
+                        if j < n and A[i] == B_rev[j]:
+                            j += 1
+                        if j == n:
+                            break
+                    
+                    max_length = j
+                    if max_length == 0:
+                        return (-1, 0, True)  # No match found
+                    
+                    # Collect positions of subsequence matches
+                    for i in range(m - 1, -1, -1):
+                        if max_length == 0:
+                            break
+                        if A[i] == B_rev[max_length - 1]:
+                            positions.append(i)
+                            max_length -= 1
+                    
+                    # Determine if the match is unique
+                    is_unique = len(positions) == 1
+                    
+                    # NOTE + 1
+                    return (positions[-1] + 1, len(positions), is_unique)
+
+
+                def run(y):
+                    nonlocal pos
+                    nonlocal sz
+                    nonlocal hist_tokens
+
+                    if len(y) == 0:
+                        print("no y!")
+                        return mx.array([], mx.uint32)
+
+                    hist_tokens.extend(y)
+
+                    # y[0] is the first decoded token from the last batch
+                    # streak
+                    if pos is not None and len(y)-1 == sz and y[-1] == pred_tokens[pos + sz]:
+                        print(f"Continuing at {pos + len(y)}, old size {sz}")
+                        # streak continues
+                        # this is basically what we already have in llama.cpp
+                        pos = pos + sz + 1
+                        sz = min(max(32, sz * 2), len(pred_tokens)-pos)
+                        if pos > len(pred_tokens):
+                            pos, sz = 0, 1
+                            return mx.array([], mx.uint32)
+                    else:
+                        ## longest common subsequence but hist_tokens
+                        # has fixed end location
+                        pos, match_sz, is_unique = _find_match(pred_tokens, hist_tokens)
+                        print(f"LCS {match_sz}")
+                        sz = match_sz * 2 if is_unique else min(match_sz, 8)
+                        if sz == 0:
+                            #print("Resetting")
+                            pos, sz = 0, 1  # reset
+                        #print(f"found match of size {match_sz} at {pos}, new size: {sz}")
+                    return mx.array(pred_tokens[pos:pos+sz], mx.uint32)
+                return run
+            draft_model = construct_drafter(prediction)
+    if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
-        )
+        )       
     else:
         kwargs.pop("max_kv_size", None)
         token_generator = speculative_generate_step(
